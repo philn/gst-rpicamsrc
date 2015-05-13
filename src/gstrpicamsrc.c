@@ -204,8 +204,11 @@ static GstCaps *gst_rpi_cam_src_get_caps (GstBaseSrc * src, GstCaps * filter);
 static gboolean gst_rpi_cam_src_set_caps (GstBaseSrc * src, GstCaps * caps);
 static GstCaps *gst_rpi_cam_src_fixate (GstBaseSrc * basesrc, GstCaps * caps);
 static gboolean gst_rpi_cam_src_event (GstBaseSrc * src, GstEvent * event);
+static gboolean gst_rpi_cam_src_query (GstBaseSrc * src, GstQuery * query);
 static gboolean gst_rpi_cam_src_send_event (GstElement * element,
     GstEvent * event);
+static void gst_rpi_cam_src_get_times (GstBaseSrc * basesrc,
+    GstBuffer * buffer, GstClockTime * start, GstClockTime * end);
 
 #define gst_rpi_cam_src_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (GstRpiCamSrc, gst_rpi_cam_src,
@@ -436,6 +439,8 @@ gst_rpi_cam_src_class_init (GstRpiCamSrcClass * klass)
   basesrc_class->set_caps = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_set_caps);
   basesrc_class->fixate = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_fixate);
   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_event);
+  basesrc_class->query = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_query);
+  basesrc_class->get_times = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_get_times);
   gstelement_class->send_event = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_send_event);
   pushsrc_class->create = GST_DEBUG_FUNCPTR (gst_rpi_cam_src_create);
   raspicapture_init ();
@@ -970,6 +975,8 @@ gst_rpi_cam_src_start (GstBaseSrc * parent)
 {
   GstRpiCamSrc *src = GST_RPICAMSRC (parent);
   GST_LOG_OBJECT (src, "In src_start()");
+  src->n_frames = 0;
+  src->running_time = GST_CLOCK_TIME_NONE;
   g_mutex_lock (&src->config_lock);
   src->capture_state = raspi_capture_setup (&src->capture_config);
   /* Clear all capture flags */
@@ -988,6 +995,8 @@ gst_rpi_cam_src_stop (GstBaseSrc * parent)
     raspi_capture_stop (src->capture_state);
   raspi_capture_free (src->capture_state);
   src->capture_state = NULL;
+  src->n_frames = 0;
+  src->running_time = GST_CLOCK_TIME_NONE;
   return TRUE;
 }
 
@@ -1041,6 +1050,58 @@ gst_rpi_cam_src_event (GstBaseSrc * parent, GstEvent * event)
       break;
   }
   return ret;
+}
+
+static gboolean
+gst_rpi_cam_src_query (GstBaseSrc * parent, GstQuery * query)
+{
+  GstRpiCamSrc *src = GST_RPICAMSRC (parent);
+  gboolean res = FALSE;
+
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_LATENCY:{
+        GstClockTime latency = raspi_capture_request_latency(src->capture_state);
+        GstClockTime adjusted_latency = 
+            gst_util_uint64_scale (GST_SECOND, src->capture_config.fps_d,
+            src->capture_config.fps_n);
+        gst_query_set_latency (query, TRUE, adjusted_latency,
+            GST_CLOCK_TIME_NONE);
+        GST_DEBUG_OBJECT (src, "Reporting latency of %" GST_TIME_FORMAT ", STC latency: %" GST_TIME_FORMAT,
+                          GST_TIME_ARGS (adjusted_latency), GST_TIME_ARGS (latency));
+      res = TRUE;
+      break;
+    }
+    default:
+      res = GST_BASE_SRC_CLASS (parent_class)->query (parent, query);
+      break;
+  }
+
+done:
+
+  return res;
+}
+
+static void
+gst_rpi_cam_src_get_times (GstBaseSrc * basesrc, GstBuffer * buffer,
+    GstClockTime * start, GstClockTime * end)
+{
+  /* for live sources, sync on the timestamp of the buffer */
+  if (gst_base_src_is_live (basesrc)) {
+    GstClockTime timestamp = GST_BUFFER_PTS (buffer);
+
+    if (GST_CLOCK_TIME_IS_VALID (timestamp)) {
+      /* get duration to calculate end time */
+      GstClockTime duration = GST_BUFFER_DURATION (buffer);
+
+      if (GST_CLOCK_TIME_IS_VALID (duration)) {
+        *end = timestamp + duration;
+      }
+      *start = timestamp;
+    }
+  } else {
+    *start = -1;
+    *end = -1;
+  }
 }
 
 static GstCaps *
@@ -1153,11 +1214,21 @@ gst_rpi_cam_src_create (GstPushSrc * parent, GstBuffer ** buf)
   }
   g_mutex_unlock (&src->config_lock);
 
+  src->n_frames++;
+
   /* FIXME: Use custom allocator */
   ret = raspi_capture_fill_buffer (src->capture_state, buf, clock, base_time);
-  if (*buf)
+  if (*buf) {
     GST_LOG_OBJECT (src, "Made buffer of size %" G_GSIZE_FORMAT,
         gst_buffer_get_size (*buf));
+    GstClockTime next_time;
+    next_time = gst_util_uint64_scale_int (src->n_frames * GST_SECOND,
+        src->capture_config.fps_d, src->capture_config.fps_n);
+    //g_printerr("next_time: %" GST_TIME_FORMAT " running_time: %" GST_TIME_FORMAT "\n", GST_TIME_ARGS(next_time), GST_TIME_ARGS(src->running_time));
+    GST_BUFFER_DURATION(*buf) = next_time - src->running_time;
+    GST_LOG_OBJECT (src, "Duration: %" GST_TIME_FORMAT, GST_TIME_ARGS(GST_BUFFER_DURATION(*buf)));
+    src->running_time = next_time;
+  }
 
   if (clock)
     gst_object_unref (clock);

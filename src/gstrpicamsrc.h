@@ -73,6 +73,9 @@ struct _GstRpiCamSrc
   RASPIVID_STATE *capture_state;
   gboolean started;
 
+  GstClockTime running_time;            /* total running time */
+  gint64 n_frames;
+
   GMutex config_lock;
 
   /* channels for interface */

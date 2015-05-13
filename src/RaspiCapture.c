@@ -924,6 +924,19 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
    mmal_queue_put(state->encoded_buffer_q, buffer);
 }
 
+GstClockTime raspi_capture_request_latency(RASPIVID_STATE *state)
+{
+    MMAL_PARAMETER_INT64_T param;
+
+    param.hdr.id = MMAL_PARAMETER_SYSTEM_TIME;
+    param.hdr.size = sizeof(param);
+    param.value = -1;
+
+    mmal_port_parameter_get(state->encoder_output_port, &param.hdr);
+
+    return param.value;
+}
+
 GstFlowReturn
 raspi_capture_fill_buffer(RASPIVID_STATE *state, GstBuffer **bufp,
     GstClock *clock, GstClockTime base_time)
